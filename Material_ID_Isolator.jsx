@@ -1,57 +1,57 @@
+// Material_ID_Isolator.jsx
+// Extracts complex CG geometry using specific RGB channels from a Material ID pass, with interactive Levels refinement.
+
 #target photoshop
 
 app.preferences.rulerUnits = Units.PIXELS;
 
 function main() {
-    var doc;
-    try {
-        doc = app.activeDocument;
-    } catch(e) {
-        alert("Please open an image first.");
+    if (app.documents.length === 0) {
+        alert("Please open a document.");
         return;
     }
 
+    var doc = app.activeDocument;
+    var beautyLayer = doc.activeLayer;
+
+    // 1. Find Material ID Layer
+    var idLayer = findMaterialIdLayer(doc);
+    if (!idLayer) {
+        alert("Could not find the Material ID layer.\nPlease name your ID layer 'Material ID' or similar.");
+        return;
+    }
+
+    if (beautyLayer === idLayer) {
+        alert("Please select the Beauty layer (the layer you want to extract from), not the ID layer.");
+        return;
+    }
+
+    // Ensure we are in RGB
+    if (doc.mode !== DocumentMode.RGB) {
+        alert("This script requires an RGB document.");
+        return;
+    }
+
+    // 2. Ask user for Channel and Invert preference
+    var userChoice = askForChannelDialog();
+    if (userChoice.cancel) {
+        return; // User aborted
+    }
+
+    // 3. Save current selection (Spatial Isolation via Lasso)
     var hasSelection = false;
     var savedSelectionChannel = null;
-    
-    // Check for active selection
     try {
-        var selBounds = doc.selection.bounds;
+        var sel = doc.selection.bounds; // will throw error if no selection
         hasSelection = true;
-        // Save the selection boundaries so we can restore it after flattening/manipulations
         savedSelectionChannel = doc.channels.add();
-        savedSelectionChannel.name = "Temp_CG_Selection_Bounds";
+        savedSelectionChannel.name = "Temp_Spatial_Isolation";
         doc.selection.store(savedSelectionChannel, SelectionType.REPLACE);
     } catch(e) {
         hasSelection = false;
     }
 
-    // We assume the active layer is the Material ID pass
-    var idLayer = doc.activeLayer;
-    
-    // Find the Beauty render (assuming it's the layer right below the ID pass for this workflow)
-    var beautyLayer = null;
-    for (var i = 0; i < doc.layers.length; i++) {
-        if (doc.layers[i] === idLayer && i < doc.layers.length - 1) {
-            beautyLayer = doc.layers[i+1];
-            break;
-        }
-    }
-    
-    if (!beautyLayer) {
-        alert("Please place the Material ID pass directly ABOVE the Beauty layer and select it.");
-        if (savedSelectionChannel) savedSelectionChannel.remove();
-        return;
-    }
-
-    // Ask user which channel provides the most contrast
-    var userChoice = askForChannelDialog();
-    if (userChoice.cancel) {
-        if (savedSelectionChannel) savedSelectionChannel.remove();
-        return;
-    }
-
-    // Process
+    // Execute the core logic
     executeExtraction(doc, beautyLayer, idLayer, userChoice, hasSelection, savedSelectionChannel);
 }
 
@@ -140,7 +140,7 @@ function executeExtraction(doc, beautyLayer, idLayer, userChoice, hasSelection, 
         
         // 9. Copy to New Layer (CTRL + J) from Beauty Layer
         doc.activeLayer = beautyLayer;
-        executeAction(charIDToTypeID("CpTL"), undefined, DialogModes.NO); // layerViaCopy
+        layerViaCopy();
 
         // Cleanup
         cleanup(doc, tempAlpha, hasSelection, savedSelectionChannel);
@@ -210,6 +210,36 @@ function askForChannelDialog() {
     
     win.show();
     return result;
+}
+
+function layerViaCopy() {
+    try {
+        var idCpTL = charIDToTypeID( "CpTL" );
+        executeAction( idCpTL, undefined, DialogModes.NO );
+    } catch (e) {
+        alert("Could not copy to new layer. Ensure your selection is not empty after Levels adjustment.");
+    }
+}
+
+function findMaterialIdLayer(doc) {
+    var searchNames = ["material id", "materialid", "mat id", "matid", "id", "material_id", "object id"];
+    return searchLayers(doc.layers, searchNames);
+}
+
+function searchLayers(layers, searchNames) {
+    for (var i = 0; i < layers.length; i++) {
+        var layerName = layers[i].name.toLowerCase();
+        for (var j = 0; j < searchNames.length; j++) {
+            if (layerName.indexOf(searchNames[j]) !== -1) {
+                return layers[i];
+            }
+        }
+        if (layers[i].typename === "LayerSet") {
+            var found = searchLayers(layers[i].layers, searchNames);
+            if (found) return found;
+        }
+    }
+    return null;
 }
 
 main();
