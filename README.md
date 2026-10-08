@@ -1,6 +1,6 @@
 # Photoshop Material ID Isolator
 
-A powerful Photoshop ExtendScript for 3D Artists and ArchViz retouchers that perfectly extracts complex CG geometry (fences, trees, fine wires) using Material ID passes.
+A powerful Photoshop ExtendScript for 3D Artists and ArchViz retouchers that helps extracts complex CG geometry (fences, trees, fine wires) using Material ID passes.
 
 ## The Problem
 Standard Photoshop tools (like Magic Wand or Color Range) fail when selecting complex objects from a CG Material ID pass:

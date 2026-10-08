@@ -1,222 +1,215 @@
-// CG_Smart_Mask.jsx
-// A tool to perfectly isolate complex CG geometry using a Material ID pass, with interactive Levels refinement.
-
 #target photoshop
 
 app.preferences.rulerUnits = Units.PIXELS;
 
 function main() {
-    if (app.documents.length === 0) {
-        alert("Please open a document.");
+    var doc;
+    try {
+        doc = app.activeDocument;
+    } catch(e) {
+        alert("Please open an image first.");
         return;
     }
 
-    var doc = app.activeDocument;
-    var beautyLayer = doc.activeLayer;
-
-    // 1. Find Material ID Layer
-    var idLayer = findMaterialIdLayer(doc);
-    if (!idLayer) {
-        alert("Could not find the Material ID layer.\nPlease name your ID layer 'Material ID' or similar.");
-        return;
-    }
-
-    if (beautyLayer === idLayer) {
-        alert("Please select the Beauty layer (the layer you want to extract from), not the ID layer.");
-        return;
-    }
-
-    // 2. Get Target Color from Foreground Color
-    var targetColor = app.foregroundColor;
-
-    // Ensure we are in RGB
-    if (doc.mode !== DocumentMode.RGB) {
-        alert("This script requires an RGB document.");
-        return;
-    }
-
-    // 3. Save current selection (Spatial Isolation)
     var hasSelection = false;
     var savedSelectionChannel = null;
+    
+    // Check for active selection
     try {
-        var sel = doc.selection.bounds; // will throw error if no selection
+        var selBounds = doc.selection.bounds;
         hasSelection = true;
+        // Save the selection boundaries so we can restore it after flattening/manipulations
         savedSelectionChannel = doc.channels.add();
-        savedSelectionChannel.name = "Temp_Spatial_Isolation";
+        savedSelectionChannel.name = "Temp_CG_Selection_Bounds";
         doc.selection.store(savedSelectionChannel, SelectionType.REPLACE);
     } catch(e) {
         hasSelection = false;
     }
 
-    // We do NOT use suspendHistory here because stopping the script midway (e.g. hitting Cancel on a dialog)
-    // inside a suspendHistory block can sometimes cause unexpected behavior in older Photoshop versions.
-    // We will handle cleanup manually.
-    executeExtraction(doc, beautyLayer, idLayer, targetColor, hasSelection, savedSelectionChannel);
+    // We assume the active layer is the Material ID pass
+    var idLayer = doc.activeLayer;
+    
+    // Find the Beauty render (assuming it's the layer right below the ID pass for this workflow)
+    var beautyLayer = null;
+    for (var i = 0; i < doc.layers.length; i++) {
+        if (doc.layers[i] === idLayer && i < doc.layers.length - 1) {
+            beautyLayer = doc.layers[i+1];
+            break;
+        }
+    }
+    
+    if (!beautyLayer) {
+        alert("Please place the Material ID pass directly ABOVE the Beauty layer and select it.");
+        if (savedSelectionChannel) savedSelectionChannel.remove();
+        return;
+    }
+
+    // Ask user which channel provides the most contrast
+    var userChoice = askForChannelDialog();
+    if (userChoice.cancel) {
+        if (savedSelectionChannel) savedSelectionChannel.remove();
+        return;
+    }
+
+    // Process
+    executeExtraction(doc, beautyLayer, idLayer, userChoice, hasSelection, savedSelectionChannel);
 }
 
-function executeExtraction(doc, beautyLayer, idLayer, targetColor, hasSelection, savedSelectionChannel) {
-    try {
-        // Switch to ID layer
-        doc.activeLayer = idLayer;
-        var wasVisible = idLayer.visible;
-        idLayer.visible = true; // Ensure it's visible for Color Range
+function executeExtraction(doc, beautyLayer, idLayer, userChoice, hasSelection, savedSelectionChannel) {
+    var tempAlpha = null;
+    var tempIdLayer = null;
 
-        // Restore selection if we had one
+    try {
+        if (userChoice.channelIndex === -1) {
+            // GRAYSCALE LOGIC: The most infallible method across all PS versions and bit-depths.
+            doc.activeLayer = idLayer;
+            
+            // 1. Isolate the layer in a temporary document
+            var tempDoc = doc.duplicate("Temp_Grayscale_Doc", true);
+            app.activeDocument = tempDoc;
+            
+            // 2. Safely convert to Grayscale (handles Smart Objects, 32-bit, etc natively)
+            tempDoc.changeMode(ChangeMode.GRAYSCALE);
+            
+            // 3. Copy the raw grayscale pixel data to the clipboard
+            tempDoc.selection.selectAll();
+            tempDoc.selection.copy();
+            tempDoc.close(SaveOptions.DONOTSAVECHANGES);
+            
+            // 4. Return to main document and create the new Alpha channel
+            app.activeDocument = doc;
+            tempAlpha = doc.channels.add();
+            tempAlpha.name = "Temp_CG_Alpha";
+            doc.activeChannels = [tempAlpha];
+            
+            // 5. Paste the grayscale data explicitly into the channel using ActionManager
+            var idpast = charIDToTypeID("past");
+            var desc = new ActionDescriptor();
+            desc.putBoolean(charIDToTypeID("inPl"), true); // Paste in place
+            executeAction(idpast, desc, DialogModes.NO);
+            
+            doc.selection.deselect();
+            
+        } else {
+            // 4. Safely extract the chosen single channel
+            doc.activeLayer = idLayer;
+            tempIdLayer = idLayer.duplicate();
+            tempIdLayer.move(doc.layers[0], ElementPlacement.PLACEBEFORE);
+            tempIdLayer.visible = true;
+
+            tempAlpha = doc.channels[userChoice.channelIndex].duplicate();
+            tempAlpha.name = "Temp_CG_Alpha";
+
+            tempIdLayer.remove();
+            tempIdLayer = null;
+        }
+
+        // Make the new alpha channel active
+        doc.activeChannels = [tempAlpha];
+
+        // 5. Invert if requested
+        if (userChoice.invert) {
+            var idInvr = charIDToTypeID( "Invr" );
+            executeAction( idInvr, undefined, DialogModes.NO );
+        }
+
+        // 6. Apply Spatial Isolation (Mask out everything outside the user's Lasso)
         if (hasSelection && savedSelectionChannel) {
             doc.selection.load(savedSelectionChannel, SelectionType.REPLACE);
-        } else {
-            doc.selection.deselect();
+            doc.selection.invert(); // Select the OUTSIDE of the lasso
+            
+            var black = new SolidColor();
+            black.rgb.red = 0; black.rgb.green = 0; black.rgb.blue = 0;
+            doc.selection.fill(black);
+            
+            doc.selection.deselect(); // Clear marching ants for a clean Levels preview
         }
 
-        // 4. Run Color Range
-        // Fuzziness around 45 is ideal for catching CG anti-aliasing gradients
-        selectColorRange(targetColor, 45); 
-
-        // Check if selection is valid
+        // 7. Interactive Mask Refinement (Levels Dialog)
         try {
-            var bnds = doc.selection.bounds;
-        } catch(e) {
-            alert("The sampled color was not found in the ID layer (or inside your lasso area).");
-            cleanup(doc, idLayer, wasVisible, hasSelection, savedSelectionChannel);
-            return;
+            executeAction( charIDToTypeID( "Lvls" ), undefined, DialogModes.ALL );
+        } catch (levelsErr) {
+            throw new Error("UserCancelled");
         }
 
-        // 5. Interactive Mask Refinement (Levels Dialog)
-        // This gives the artist the manual control they want to solidify the edges
-        refineActiveSelectionWithDialog(doc);
+        // 8. Load the perfectly refined mask as a selection
+        doc.selection.load(tempAlpha, SelectionType.REPLACE);
 
-        // 6. Copy to New Layer (CTRL + J) from Beauty Layer
+        // Restore standard RGB view
+        doc.activeChannels = doc.componentChannels;
+        
+        // 9. Copy to New Layer (CTRL + J) from Beauty Layer
         doc.activeLayer = beautyLayer;
-        layerViaCopy();
+        executeAction(charIDToTypeID("CpTL"), undefined, DialogModes.NO); // layerViaCopy
 
         // Cleanup
-        cleanup(doc, idLayer, wasVisible, hasSelection, savedSelectionChannel);
+        cleanup(doc, tempAlpha, hasSelection, savedSelectionChannel);
+
     } catch(e) {
         if (e.message !== "UserCancelled") {
             alert("An error occurred during extraction: " + e.message);
         }
-        cleanup(doc, idLayer, true, hasSelection, savedSelectionChannel);
+        if (tempIdLayer) { try { tempIdLayer.remove(); } catch(err){} }
+        cleanup(doc, tempAlpha, hasSelection, savedSelectionChannel);
     }
 }
 
-function cleanup(doc, idLayer, wasVisible, hasSelection, savedSelectionChannel) {
-    try { idLayer.visible = wasVisible; } catch(e){}
-    
-    // Ensure we are back on RGB composite if something failed
+function cleanup(doc, tempAlpha, hasSelection, savedSelectionChannel) {
     try { doc.activeChannels = doc.componentChannels; } catch(e){}
-
+    
+    if (tempAlpha) {
+        try { tempAlpha.remove(); } catch(e) {}
+    }
+    
     if (hasSelection && savedSelectionChannel) {
         try { savedSelectionChannel.remove(); } catch(e) {}
     }
 }
 
-function selectColorRange(color, fuzziness) {
-    var idClrR = charIDToTypeID( "ClrR" );
-    var desc = new ActionDescriptor();
-    var idFzns = charIDToTypeID( "Fzns" );
-    desc.putInteger( idFzns, fuzziness );
+function askForChannelDialog() {
+    var win = new Window("dialog", "Material ID Isolator");
+    win.alignChildren = "fill";
     
-    var idMnm = charIDToTypeID( "Mnm " );
-    var descColor = new ActionDescriptor();
-    descColor.putDouble( charIDToTypeID( "Rd  " ), color.rgb.red );
-    descColor.putDouble( charIDToTypeID( "Grn " ), color.rgb.green );
-    descColor.putDouble( charIDToTypeID( "Bl  " ), color.rgb.blue );
-    desc.putObject( idMnm, charIDToTypeID( "RGBC" ), descColor );
+    win.add("statictext", undefined, "Select the channel with the best contrast for your object:");
     
-    var idMxm = charIDToTypeID( "Mxm " );
-    var descColorMax = new ActionDescriptor();
-    descColorMax.putDouble( charIDToTypeID( "Rd  " ), color.rgb.red );
-    descColorMax.putDouble( charIDToTypeID( "Grn " ), color.rgb.green );
-    descColorMax.putDouble( charIDToTypeID( "Bl  " ), color.rgb.blue );
-    desc.putObject( idMxm, charIDToTypeID( "RGBC" ), descColorMax );
+    var panel = win.add("panel", undefined, "Base Channel");
+    panel.alignChildren = "left";
+    panel.margins = 15;
     
-    executeAction( idClrR, desc, DialogModes.NO );
-}
+    var btnGray = panel.add("radiobutton", undefined, "Grayscale (Combines ALL channels to prevent missing gaps)");
+    var btnR = panel.add("radiobutton", undefined, "Red Channel");
+    var btnG = panel.add("radiobutton", undefined, "Green Channel");
+    var btnB = panel.add("radiobutton", undefined, "Blue Channel");
+    
+    // Grayscale is mathematically safest for highly compressed thin CG geometry
+    btnGray.value = true; 
+    
+    var cbInvert = win.add("checkbox", undefined, "Invert Mask (Check this if your object is DARKER than the background)");
+    cbInvert.margins = [0, 10, 0, 10];
 
-function refineActiveSelectionWithDialog(doc) {
-    var tempAlpha = null;
-    try {
-        tempAlpha = doc.channels.add();
-        tempAlpha.name = "Temp_CG_Alpha";
-        doc.selection.store(tempAlpha, SelectionType.REPLACE);
-        
-        doc.selection.deselect();
-        
-        // Isolate the view to just our temporary mask so the user can see it
-        doc.activeChannels = [tempAlpha];
-        
-        // Prepare Levels command
-        var idLvls = charIDToTypeID( "Lvls" );
-        var descLvl = new ActionDescriptor();
-        var idAdjs = charIDToTypeID( "Adjs" );
-        var list = new ActionList();
-        var descChnl = new ActionDescriptor();
-        var idChnl = charIDToTypeID( "Chnl" );
-        var ref = new ActionReference();
-        ref.putEnumerated( idChnl, idChnl, charIDToTypeID( "Trgt" ) );
-        descChnl.putReference( idChnl, ref );
-        
-        // Set up default starting values for the dialog that are good for CG edges
-        var idInpt = charIDToTypeID( "Inpt" );
-        var list2 = new ActionList();
-        list2.putInteger( 0 );   // Black point
-        list2.putInteger( 220 ); // White point (contracts highlights to solidify edges)
-        descChnl.putList( idInpt, list2 );
-        var idGmm = charIDToTypeID( "Gmm " );
-        descChnl.putDouble( idGmm, 1.3 ); // Boost midtones
-        
-        var idLvlA = charIDToTypeID( "LvlA" );
-        list.putObject( idLvlA, descChnl );
-        descLvl.putList( idAdjs, list );
-        
-        // Execute Levels WITH DIALOG so the user can visually adjust
-        // If the user hits Cancel, an exception is thrown.
-        executeAction( idLvls, descLvl, DialogModes.ALL );
-        
-        // Restore composite channels and load selection
-        doc.activeChannels = doc.componentChannels;
-        doc.selection.load(tempAlpha, SelectionType.REPLACE);
-        tempAlpha.remove();
-        
-    } catch (e) {
-        // User pressed Cancel on the Levels dialog, or something failed.
-        // We clean up and abort the extraction.
-        doc.activeChannels = doc.componentChannels;
-        if (tempAlpha) {
-            try { tempAlpha.remove(); } catch(err){}
-        }
-        throw new Error("UserCancelled");
+    var btnGroup = win.add("group");
+    btnGroup.alignment = "center";
+    var btnOk = btnGroup.add("button", undefined, "OK");
+    var btnCancel = btnGroup.add("button", undefined, "Cancel");
+    
+    var result = { channelIndex: -1, invert: false, cancel: true };
+    
+    btnOk.onClick = function() {
+        if (btnGray.value) result.channelIndex = -1;
+        if (btnR.value) result.channelIndex = 0;
+        if (btnG.value) result.channelIndex = 1;
+        if (btnB.value) result.channelIndex = 2;
+        result.invert = cbInvert.value;
+        result.cancel = false;
+        win.close();
     }
-}
-
-function layerViaCopy() {
-    try {
-        var idCpTL = charIDToTypeID( "CpTL" );
-        executeAction( idCpTL, undefined, DialogModes.NO );
-    } catch (e) {
-        alert("Could not copy to new layer. Ensure your selection is not empty.");
+    
+    btnCancel.onClick = function() {
+        win.close();
     }
-}
-
-function findMaterialIdLayer(doc) {
-    var searchNames = ["material id", "materialid", "mat id", "matid", "id", "material_id", "object id"];
-    return searchLayers(doc.layers, searchNames);
-}
-
-function searchLayers(layers, searchNames) {
-    for (var i = 0; i < layers.length; i++) {
-        var layerName = layers[i].name.toLowerCase();
-        for (var j = 0; j < searchNames.length; j++) {
-            if (layerName.indexOf(searchNames[j]) !== -1) {
-                return layers[i];
-            }
-        }
-        if (layers[i].typename === "LayerSet") {
-            var found = searchLayers(layers[i].layers, searchNames);
-            if (found) return found;
-        }
-    }
-    return null;
+    
+    win.show();
+    return result;
 }
 
 main();
